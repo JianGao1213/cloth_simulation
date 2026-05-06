@@ -2,10 +2,6 @@
 
 浏览器里的 **2D 悬挂布料物理 + 丝质高光着色** 演示：单文件 HTML，无需构建，双击或用静态服务器打开即可。
 
-## 在线预览
-
-将仓库托管到 GitHub 后，可在仓库 **Settings → Pages** 开启 GitHub Pages，选择 `main` 分支根目录，即可通过站点地址访问 `cloth-simulation.html`。
-
 本地可直接用浏览器打开：
 
 ```text
@@ -48,7 +44,3 @@ cloth_simulation/
 ├── README.md
 └── cloth-simulation.html   # 唯一源码入口
 ```
-
-## License
-
-如需开源协议，可自行在仓库根目录添加 `LICENSE` 文件。
