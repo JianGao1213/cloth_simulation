@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>布料物理 · 丝质表面</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      min-height: 100%;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: auto;
+      background: radial-gradient(ellipse at 50% 28%, #1c2238 0%, #080a10 72%);
+      font-family: system-ui, sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 150px;
+      height: 300px;
+      cursor: crosshair;
+    }
+    .hint {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: rgba(255,255,255,0.32);
+      font-size: 13px;
+      pointer-events: none;
+      letter-spacing: 0.05em;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <p class="hint">轻触推动 · 高密度网格更贴近真实织物</p>
+  <script>
+(function () {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  const CLOTH_CSS_W = 150;
+  const CLOTH_CSS_H = 300;
+  const COLS = 102;
+  const ROWS = 72;
+  const GRAVITY = 0.112;
+  const DAMPING = 0.992;
+  /** 底缘额外速度衰减，减轻下角折叠处的数值抖动与反复甩动 */
+  const DAMP_BOTTOM_EXTRA = 0.018;
+  const CONSTRAINT_ITERS = 17;
+  const SUBSTEPS = 3;
+  const MOUSE_PUSH = 2.65;
+  const MOUSE_DRAG = 0.12;
+  const Z_SAG = 0.88;
+  const LIGHT = { x: 0.35, y: -0.55, z: 0.76 };
+  const SPEC_POW = 28;
+  const BASE_RGB = { r: 110, g: 142, b: 178 };
+  /** 绘制时每格在光照空间细分块数，越大越不显网格线（略增绘制量） */
+  const SHADE_SUBDIV = 3;
+  let edgeSoft = 10;
+  let mouseRadius = 40;
+
+  let w, h, cellW, cellH;
+  let hangFloor = 0;
+  const points = [];
+  const constraints = [];
+  const Llen = Math.hypot(LIGHT.x, LIGHT.y, LIGHT.z);
+  const Lx = LIGHT.x / Llen, Ly = LIGHT.y / Llen, Lz = LIGHT.z / Llen;
+
+  function Point(x, y, rx, ry, row, pinned) {
+    this.x = x; this.y = y;
+    this.px = x; this.py = y;
+    this.rx = rx; this.ry = ry;
+    this.row = row;
+    this.pinned = !!pinned;
+  }
+
+  function Constraint(a, b, rest, stiffness) {
+    this.a = a; this.b = b; this.rest = rest;
+    this.k = stiffness;
+  }
+
+  function init() {
+    const dpr = devicePixelRatio;
+    w = canvas.width = Math.max(1, Math.floor(CLOTH_CSS_W * dpr));
+    h = canvas.height = Math.max(1, Math.floor(CLOTH_CSS_H * dpr));
+    canvas.style.width = CLOTH_CSS_W + 'px';
+    canvas.style.height = CLOTH_CSS_H + 'px';
+
+    edgeSoft = Math.max(4, Math.min(w, h) * 0.028);
+    mouseRadius = Math.max(16 * dpr, Math.min(w, h) * 0.24);
+
+    const marginX = 0;
+    const marginY = 0;
+    cellW = (w - 2 * marginX) / (COLS - 1);
+    cellH = (h - 2 * marginY) / (ROWS - 1);
+
+    points.length = 0;
+    constraints.length = 0;
+
+    for (let j = 0; j < ROWS; j++) {
+      for (let i = 0; i < COLS; i++) {
+        const rx = marginX + i * cellW;
+        const ry = marginY + j * cellH;
+        const x = rx + (Math.random() - 0.5) * 0.012;
+        const y = ry + (Math.random() - 0.5) * 0.012;
+        const pin = j === 0;
+        points.push(new Point(x, y, rx, ry, j, pin));
+      }
+    }
+
+    hangFloor = Infinity;
+    for (let i = 0; i < COLS; i++) {
+      hangFloor = Math.min(hangFloor, points[i].y);
+    }
+
+    function idx(i, j) { return j * COLS + i; }
+
+    function addC(i0, j0, i1, j1, k) {
+      const a = points[idx(i0, j0)];
+      const b = points[idx(i1, j1)];
+      const dx = a.x - b.x, dy = a.y - b.y;
+      constraints.push(new Constraint(a, b, Math.hypot(dx, dy), k));
+    }
+
+    const K_STRUCT = 1;
+    const K_SHEAR = 0.68;
+    const K_BEND = 0.65;
+
+    for (let j = 0; j < ROWS; j++) {
+      for (let i = 0; i < COLS; i++) {
+        if (i < COLS - 1) addC(i, j, i + 1, j, K_STRUCT);
+        if (j < ROWS - 1) addC(i, j, i, j + 1, K_STRUCT);
+        if (i < COLS - 1 && j < ROWS - 1) {
+          addC(i, j, i + 1, j + 1, K_SHEAR);
+          addC(i + 1, j, i, j + 1, K_SHEAR);
+        }
+      }
+    }
+    for (let j = 0; j < ROWS; j++) {
+      for (let i = 0; i < COLS; i++) {
+        if (i < COLS - 2) addC(i, j, i + 2, j, K_BEND);
+        if (j < ROWS - 2) addC(i, j, i, j + 2, K_BEND);
+      }
+    }
+  }
+
+  let mouseX = -9999, mouseY = -9999;
+  let prevMX = -9999, prevMY = -9999;
+
+  canvas.addEventListener('mousemove', (e) => {
+    const r = canvas.getBoundingClientRect();
+    const sx = (e.clientX - r.left) * (w / r.width);
+    const sy = (e.clientY - r.top) * (h / r.height);
+    prevMX = mouseX; prevMY = mouseY;
+    mouseX = sx; mouseY = sy;
+  });
+  canvas.addEventListener('mouseleave', () => {
+    mouseX = mouseY = -9999;
+    prevMX = prevMY = -9999;
+  });
+
+  function smoothstep(t) {
+    t = Math.max(0, Math.min(1, t));
+    return t * t * (3 - 2 * t);
+  }
+
+  function enforceBelowRod() {
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.pinned) continue;
+      if (p.y < hangFloor) {
+        p.y = hangFloor;
+        p.py = p.y;
+        const slip = p.x - p.px;
+        p.px = p.x - slip * 0.72;
+      }
+    }
+  }
+
+  function satisfyConstraints() {
+    for (let k = 0; k < CONSTRAINT_ITERS; k++) {
+      for (let c = 0; c < constraints.length; c++) {
+        const con = constraints[c];
+        const a = con.a, b = con.b;
+        if (a.pinned && b.pinned) continue;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const dist = Math.hypot(dx, dy) || 1e-6;
+        const diff = (con.rest - dist) / dist;
+        const ox = dx * diff * 0.5 * con.k, oy = dy * diff * 0.5 * con.k;
+        if (!a.pinned) { a.x -= ox; a.y -= oy; }
+        if (!b.pinned) { b.x += ox; b.y += oy; }
+      }
+      enforceBelowRod();
+    }
+  }
+
+  function edgeFalloff(p) {
+    const px = p.x, py = p.y;
+    const es = edgeSoft;
+    let f = 1;
+    if (px < es) f *= smoothstep(px / es);
+    if (px > w - es) f *= smoothstep((w - px) / es);
+    if (py < es) f *= smoothstep(py / es);
+    if (py > h - es) f *= smoothstep((h - py) / es);
+    return f;
+  }
+
+  function rowPinFalloff(p) {
+    const t = p.row / (ROWS - 1);
+    return smoothstep(t * 1.4);
+  }
+
+  function verletStep() {
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.pinned) continue;
+
+      const rowT = p.row / (ROWS - 1);
+      const damp = DAMPING * (1 - DAMP_BOTTOM_EXTRA * rowT * rowT);
+      const vx = (p.x - p.px) * damp;
+      const vy = (p.y - p.py) * damp;
+      p.px = p.x;
+      p.py = p.y;
+      p.x += vx;
+      p.y += vy + GRAVITY;
+
+      const dx = p.x - mouseX, dy = p.y - mouseY;
+      const d2 = dx * dx + dy * dy;
+      const r2 = mouseRadius * mouseRadius;
+      const edgeF = edgeFalloff(p);
+      const pinF = rowPinFalloff(p);
+
+      if (d2 < r2 && d2 > 0.25) {
+        const d = Math.sqrt(d2);
+        const t = 1 - d / mouseRadius;
+        const fall = smoothstep(t) * smoothstep(t) * smoothstep(t);
+        let push = fall * MOUSE_PUSH * edgeF * pinF;
+        const nx = dx / d, ny = dy / d;
+        const rodBand = Math.max(28, h * 0.28);
+        if (ny < 0 && p.y < hangFloor + rodBand) {
+          push *= 0.35 + 0.65 * smoothstep((p.y - hangFloor) / rodBand);
+        }
+        p.x += nx * push;
+        p.y += ny * push;
+      }
+
+      if (prevMX > -5000 && mouseX > -5000) {
+        const mdx = mouseX - prevMX, mdy = mouseY - prevMY;
+        const speed = Math.hypot(mdx, mdy);
+        if (speed > 0.08 && d2 < r2 * 2.5) {
+          const t = 1 - d2 / (r2 * 2.5);
+          const drag = smoothstep(Math.max(0, t)) * smoothstep(Math.max(0, t)) * MOUSE_DRAG * edgeF * pinF;
+          p.x += mdx * drag;
+          p.y += mdy * drag;
+        }
+      }
+
+      /* 四角 edgeFalloff 接近 0 时几乎不反弹，易在边界附近来回抖；设下限使修正始终有效 */
+      const sf = Math.max(edgeFalloff(p), 0.5);
+      const bk = 0.42;
+      if (p.x < 0) {
+        p.x += -p.x * bk * sf;
+        p.px += (p.x - p.px) * 0.12;
+      }
+      if (p.x > w) {
+        p.x -= (p.x - w) * bk * sf;
+        p.px += (p.x - p.px) * 0.12;
+      }
+      if (p.y < 0) {
+        p.y += -p.y * bk * sf;
+        p.py += (p.y - p.py) * 0.12;
+      }
+      if (p.y > h) {
+        p.y -= (p.y - h) * bk * sf;
+        p.py += (p.y - p.py) * 0.12;
+      }
+
+      if (p.y < hangFloor) {
+        p.y = hangFloor;
+        p.py = p.y;
+        /* 挂杆处摩擦，削弱沿杆来回滑动的寄生振荡 */
+        const slip = p.x - p.px;
+        p.px = p.x - slip * 0.72;
+      }
+    }
+  }
+
+  function lift(p) {
+    return { x: p.x, y: p.y, z: Z_SAG * (p.y - p.ry) };
+  }
+
+  function triNormal(a, b, c) {
+    const ax = b.x - a.x, ay = b.y - a.y, az = b.z - a.z;
+    const bx = c.x - a.x, by = c.y - a.y, bz = c.z - a.z;
+    let nx = ay * bz - az * by;
+    let ny = az * bx - ax * bz;
+    let nz = ax * by - ay * bx;
+    const nl = Math.hypot(nx, ny, nz) || 1e-6;
+    return { nx: nx / nl, ny: ny / nl, nz: nz / nl };
+  }
+
+  function shadeFromNormal(nx, ny, nz) {
+    if (nz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+    let diff = Math.max(0, nx * Lx + ny * Ly + nz * Lz);
+    diff = 0.3 + 0.7 * diff;
+    let hx = Lx, hy = Ly, hz = Lz + 1;
+    const hl = Math.hypot(hx, hy, hz) || 1e-6;
+    hx /= hl; hy /= hl; hz /= hl;
+    const spec = Math.pow(Math.max(0, nx * hx + ny * hy + nz * hz), SPEC_POW);
+    const cr = Math.min(255, BASE_RGB.r * diff + 220 * spec);
+    const cg = Math.min(255, BASE_RGB.g * diff + 228 * spec);
+    const cb = Math.min(255, BASE_RGB.b * diff + 235 * spec);
+    return 'rgb(' + (cr | 0) + ',' + (cg | 0) + ',' + (cb | 0) + ')';
+  }
+
+  function shadeQuad(A, B, C, D) {
+    const n1 = triNormal(A, B, C);
+    const n2 = triNormal(A, C, D);
+    let nx = n1.nx + n2.nx, ny = n1.ny + n2.ny, nz = n1.nz + n2.nz;
+    const nl = Math.hypot(nx, ny, nz) || 1e-6;
+    nx /= nl; ny /= nl; nz /= nl;
+    return shadeFromNormal(nx, ny, nz);
+  }
+
+  /** 四边形参数域双线性插值（与顶点顺序 A=p00,B=p10,C=p11,D=p01 一致） */
+  function lerpLift(u, v, A, B, C, D) {
+    const ou = 1 - u, ov = 1 - v;
+    return {
+      x: ou * ov * A.x + u * ov * B.x + u * v * C.x + ou * v * D.x,
+      y: ou * ov * A.y + u * ov * B.y + u * v * C.y + ou * v * D.y,
+      z: ou * ov * A.z + u * ov * B.z + u * v * C.z + ou * v * D.z
+    };
+  }
+
+  function fillShadedQuad(c, A, B, C, D) {
+    const fill = shadeQuad(A, B, C, D);
+    c.fillStyle = fill;
+    c.beginPath();
+    c.moveTo(A.x, A.y);
+    c.lineTo(B.x, B.y);
+    c.lineTo(C.x, C.y);
+    c.closePath();
+    c.fill();
+    c.beginPath();
+    c.moveTo(A.x, A.y);
+    c.lineTo(C.x, C.y);
+    c.lineTo(D.x, D.y);
+    c.closePath();
+    c.fill();
+  }
+
+  function draw() {
+    ctx.fillStyle = '#080a10';
+    ctx.fillRect(0, 0, w, h);
+
+    const sub = Math.max(1, SHADE_SUBDIV | 0);
+    for (let j = 0; j < ROWS - 1; j++) {
+      for (let i = 0; i < COLS - 1; i++) {
+        const i00 = j * COLS + i;
+        const i10 = i00 + 1;
+        const i01 = i00 + COLS;
+        const i11 = i01 + 1;
+        const p00 = points[i00], p10 = points[i10];
+        const p01 = points[i01], p11 = points[i11];
+
+        const A = lift(p00), B = lift(p10), C = lift(p11), D = lift(p01);
+
+        if (sub <= 1) {
+          fillShadedQuad(ctx, A, B, C, D);
+          continue;
+        }
+        for (let sj = 0; sj < sub; sj++) {
+          for (let si = 0; si < sub; si++) {
+            const u0 = si / sub, u1 = (si + 1) / sub;
+            const v0 = sj / sub, v1 = (sj + 1) / sub;
+            const q00 = lerpLift(u0, v0, A, B, C, D);
+            const q10 = lerpLift(u1, v0, A, B, C, D);
+            const q11 = lerpLift(u1, v1, A, B, C, D);
+            const q01 = lerpLift(u0, v1, A, B, C, D);
+            fillShadedQuad(ctx, q00, q10, q11, q01);
+          }
+        }
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  function tick() {
+    for (let s = 0; s < SUBSTEPS; s++) {
+      verletStep();
+      satisfyConstraints();
+      enforceBelowRod();
+    }
+    draw();
+  }
+
+  window.addEventListener('resize', () => { init(); });
+  init();
+  tick();
+})();
+  </script>
+</body>
+</html>
